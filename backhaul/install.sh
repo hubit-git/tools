@@ -120,7 +120,15 @@ first_user_port() {
 apply_stability_keys() {
   local file="$CONF_DIR/$1.toml" transport
   transport=$(grep -m1 '^transport' "$file" | cut -d'"' -f2)
-  if [ "$(tunnel_role "$1")" = "server" ]; then
+  if [ "$transport" = "udp" ]; then
+    # TCP keepalive / mux options don't apply to the UDP transport
+    if [ "$(tunnel_role "$1")" = "server" ]; then
+      set_kv "$file" heartbeat 20
+      set_kv "$file" channel_size 2048
+    else
+      set_kv "$file" retry_interval 3
+    fi
+  elif [ "$(tunnel_role "$1")" = "server" ]; then
     set_kv "$file" heartbeat 20
     set_kv "$file" keepalive_period 20
     set_kv "$file" channel_size 2048
@@ -163,13 +171,24 @@ choose_transport() {
   echo "  2) tcp      (simple, no multiplexing)"
   echo "  3) wsmux    (use if DPI causes problems)"
   echo "  4) wssmux   (WebSocket + TLS, most resistant to filtering)"
+  echo "  --- UDP (e.g. WireGuard, Hysteria, OpenVPN-UDP) ---"
+  echo "  5) udp            (native UDP tunnel - user ports are UDP)"
+  echo "  6) tcp + UDP      (UDP over TCP - use if UDP between the servers is blocked/throttled)"
   read -rp "Choice [1]: " t
+  ACCEPT_UDP=""
   case "${t:-1}" in
     2) TRANSPORT="tcp" ;;
     3) TRANSPORT="wsmux" ;;
     4) TRANSPORT="wssmux" ;;
+    5) TRANSPORT="udp" ;;
+    6) TRANSPORT="tcp"; ACCEPT_UDP="true" ;;
     *) TRANSPORT="tcpmux" ;;
   esac
+}
+
+# True if the tunnel carries UDP user traffic (udp transport or accept_udp)
+carries_udp() {
+  [ "$TRANSPORT" = "udp" ] || [ "$ACCEPT_UDP" = "true" ]
 }
 
 # Sets BIND_HOST based on the IP version the tunnel should listen on
@@ -314,7 +333,9 @@ create_server() {
 
   read -rp "Tunnel port (the client connects to this) [3080]: " TPORT
   TPORT=${TPORT:-3080}
-  if ss -tln | grep -q ":$TPORT "; then
+  local ss_flag="-tln"
+  [ "$TRANSPORT" = "udp" ] && ss_flag="-uln"
+  if ss $ss_flag | grep -q ":$TPORT "; then
     warn "Port $TPORT is already in use on this server!"
     read -rp "Continue? [y/N]: " r
     [[ ! "$r" =~ ^[yY]$ ]] && return
@@ -327,9 +348,15 @@ create_server() {
   echo "Enter user ports separated by commas."
   echo "  443        -> port 443 on this server to port 443 on the destination"
   echo "  8443:443   -> port 8443 on this server to port 443 on the destination"
-  echo "  Example: 443,1126,8443:443"
-  read -rp "Ports [443]: " PORTS
-  PORTS=${PORTS:-443}
+  local def_ports=443
+  if carries_udp; then
+    def_ports=51820
+    echo "  Example (WireGuard): 51820   or   51820,2408:51820"
+  else
+    echo "  Example: 443,1126,8443:443"
+  fi
+  read -rp "Ports [$def_ports]: " PORTS
+  PORTS=${PORTS:-$def_ports}
   build_ports "$PORTS" "$DEST_IP" || return
 
   {
@@ -338,7 +365,8 @@ create_server() {
     echo "transport = \"$TRANSPORT\""
     echo "token = \"$TOKEN\""
     echo "log_level = \"info\""
-    echo "nodelay = true"
+    [ "$TRANSPORT" != "udp" ] && echo "nodelay = true"
+    [ "$ACCEPT_UDP" = "true" ] && echo "accept_udp = true"
     echo "ports = $PORT_LIST"
   } > "$CONF_DIR/$name.toml"
 
@@ -363,18 +391,29 @@ create_server() {
   echo "======================================"
   echo " ✅ Tunnel '$name' (SERVER) is ready"
   echo " 🔑 Token:          $TOKEN"
-  echo " 🚇 Transport:      $TRANSPORT"
+  if [ "$ACCEPT_UDP" = "true" ]; then
+    echo " 🚇 Transport:      tcp + UDP over TCP (choose option 6 on the client too)"
+  else
+    echo " 🚇 Transport:      $TRANSPORT"
+  fi
   echo " 🌐 Listening on:   IPv$IP_VER ($BIND_HOST:$TPORT)"
   echo " 📍 Client connects to: $client_addr  port $TPORT"
   echo " 🎯 Destination:    $DEST_IP"
   echo " 🚪 Ports:          $PORTS"
   echo " Enter this token, transport and address on the CLIENT."
   echo " Then enable the watchdog for this tunnel (menu option 11)."
+  local tproto="TCP" uproto="TCP"
+  [ "$TRANSPORT" = "udp" ] && tproto="UDP"
+  carries_udp && uproto="UDP"
   if [ "$IP_VER" = "6" ]; then
-    echo " Firewall: open port $TPORT for IPv6 too (ip6tables / ufw with IPV6=yes),"
-    echo "           plus the user ports ($PORTS)."
+    echo " Firewall: open $tproto port $TPORT for IPv6 too (ip6tables / ufw with IPV6=yes),"
+    echo "           plus the user ports ($PORTS, $uproto)."
   else
-    echo " Firewall: port $TPORT (from the client's IP) and the user ports ($PORTS) must be open."
+    echo " Firewall: $tproto port $TPORT (from the client's IP) and the user ports ($PORTS, $uproto) must be open."
+  fi
+  if carries_udp; then
+    echo " WireGuard tip: set MTU = 1280 in the users' WireGuard configs to avoid"
+    echo "                fragmentation inside the tunnel."
   fi
   echo "======================================"
 }
@@ -398,23 +437,29 @@ create_client() {
   read -rp "Token (same token as the server): " TOKEN
   [ -z "$TOKEN" ] && { err "Token cannot be empty."; return; }
 
-  cat > "$CONF_DIR/$name.toml" <<EOF
-[client]
-remote_addr = "$host:$TPORT"
-transport = "$TRANSPORT"
-token = "$TOKEN"
-log_level = "info"
-connection_pool = 8
-retry_interval = 3
-nodelay = true
-EOF
+  {
+    echo "[client]"
+    echo "remote_addr = \"$host:$TPORT\""
+    echo "transport = \"$TRANSPORT\""
+    echo "token = \"$TOKEN\""
+    echo "log_level = \"info\""
+    echo "connection_pool = 8"
+    echo "retry_interval = 3"
+    [ "$TRANSPORT" != "udp" ] && echo "nodelay = true"
+  } > "$CONF_DIR/$name.toml"
+  # Note: accept_udp is a server-side option; the client just uses the tcp transport.
   apply_stability_keys "$name"
 
   write_service "$name"
   echo ""
   ok "Tunnel '$name' (CLIENT) is ready -> $host:$TPORT"
-  echo "Check that this server can reach the destination (xray IP/port), e.g.:"
-  echo "  nc -zv DEST_IP 443"
+  if carries_udp; then
+    echo "Make sure the UDP service (e.g. WireGuard) is listening on the destination:"
+    echo "  ss -uln | grep 51820"
+  else
+    echo "Check that this server can reach the destination (xray IP/port), e.g.:"
+    echo "  nc -zv DEST_IP 443"
+  fi
   is_ipv6 "$SRV_IP" && echo "You can test the IPv6 link to the server with menu option 6."
   echo "Tip: enable the watchdog (menu option 11) on the SERVER side of this tunnel."
 }
@@ -576,11 +621,15 @@ check() {
       [ -n "$code" ] && [ "$code" != "000" ] ;;
     tcp)
       timeout 5 bash -c "</dev/tcp/127.0.0.1/$CHECK_PORT" 2>/dev/null ;;
+    alive)
+      # Only the service state (checked above) and scheduled restarts are used
+      true ;;
     *)
       # conn: at least one established tunnel connection on the tunnel port
-      local f
+      local f proto=-Htn
+      grep -q '^transport = "udp"' "$CONF" && proto=-Hun
       if [ "$ROLE" = server ]; then f="sport = :$TPORT"; else f="dport = :$TPORT"; fi
-      [ "$(ss -Htn state established "( $f )" 2>/dev/null | wc -l)" -gt 0 ] ;;
+      [ "$(ss $proto state established "( $f )" 2>/dev/null | wc -l)" -gt 0 ] ;;
   esac
 }
 
@@ -675,12 +724,30 @@ watchdog_status() {
 }
 
 watchdog_enable() {
-  local n="$1" role mode port sni fails every def_port r
+  local n="$1" role mode port sni fails every def_port r t_transport def_every=0
   role=$(tunnel_role "$n")
+  t_transport=$(grep -m1 '^transport' "$CONF_DIR/$n.toml" | cut -d'"' -f2)
   install_watchdog_files
 
   echo ""
-  if [ "$role" = "server" ]; then
+  if [ "$t_transport" = "udp" ]; then
+    warn "This is a native UDP tunnel. UDP has no handshake, so a real traffic check"
+    echo "isn't possible. The watchdog will restart the tunnel if the service dies,"
+    if [ "$role" = "client" ]; then
+      echo "if it loses its tunnel connection, and optionally on a schedule."
+      mode=conn
+    else
+      echo "and on a schedule (recommended for UDP: every 6 hours)."
+      mode=alive
+    fi
+    def_every=6
+  elif grep -q '^accept_udp = true' "$CONF_DIR/$n.toml"; then
+    echo "This tunnel carries UDP over TCP. UDP user ports (e.g. WireGuard) can't be"
+    echo "checked with tls/http/tcp, so 'conn' (tunnel connection exists) is used."
+    echo "Add a scheduled restart for extra safety."
+    mode=conn
+    def_every=6
+  elif [ "$role" = "server" ]; then
     echo "How should the watchdog check this tunnel?"
     echo "  1) tls   - TLS handshake through the tunnel to xray (best for TLS / Reality ports)"
     echo "  2) http  - HTTP request through the tunnel (for ws / http / non-TLS inbounds)"
@@ -711,8 +778,8 @@ watchdog_enable() {
   fails=${fails:-2}
   [[ "$fails" =~ ^[1-9][0-9]*$ ]] || { err "Invalid number."; return; }
 
-  read -rp "Also restart on a schedule every N hours? (0 = off) [0]: " every
-  every=${every:-0}
+  read -rp "Also restart on a schedule every N hours? (0 = off) [$def_every]: " every
+  every=${every:-$def_every}
   [[ "$every" =~ ^[0-9]+$ ]] || { err "Invalid number."; return; }
 
   cat > "$CONF_DIR/$n.watchdog" <<EOF
@@ -803,6 +870,9 @@ net.ipv4.tcp_keepalive_probes = 6
 net.netfilter.nf_conntrack_max = 262144
 net.core.somaxconn = 4096
 fs.file-max = 1048576
+# Larger socket buffers - helps UDP tunnels (WireGuard etc.) under load
+net.core.rmem_max = 26214400
+net.core.wmem_max = 26214400
 EOF
   sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1
   ok "sysctl settings applied."
@@ -832,7 +902,7 @@ while true; do
   print_header
   echo " ${C_BOLD}🔧 Install & Create${C_RESET}"
   echo "   1) 📦 Install Backhaul"
-  echo "   2) ➕ Create a new tunnel (server / client, IPv4 / IPv6)"
+  echo "   2) ➕ Create a new tunnel (server / client, IPv4 / IPv6, TCP / UDP)"
   echo ""
   echo " ${C_BOLD}📊 Monitoring${C_RESET}"
   echo "   3) 📋 List tunnels"
