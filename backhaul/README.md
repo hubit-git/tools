@@ -1,5 +1,7 @@
 # Backhaul Tunnel Manager
 
+**English** | [فارسی](README.fa.md)
+
 An interactive Bash menu for installing, creating and maintaining multiple [Backhaul](https://github.com/Musixal/Backhaul) reverse tunnels on one server — with IPv6 support, a built-in watchdog that restarts hung tunnels, and stability tuning.
 
 Built for the common Iran ⇄ foreign server setup, but works anywhere Backhaul does.
