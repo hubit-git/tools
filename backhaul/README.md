@@ -25,6 +25,7 @@ Built for the common Iran ⇄ foreign server setup, but works anywhere Backhaul 
 - **2-layer and 3-layer setups.** `Iran ← Foreign` or `Iran ← Relay → Destination`.
 - **IPv4 and IPv6.** Listen on `0.0.0.0` or `[::]`, and connect to IPv6 servers or destinations. Brackets are added automatically. Useful when a server's IPv4 is blocked but IPv6 still works.
 - **Transports:** `tcpmux`, `tcp`, `wsmux`, `wssmux` (a self-signed certificate is generated automatically for `wssmux`).
+- **UDP tunnels** for WireGuard, Hysteria, OpenVPN-UDP and similar: either native `udp`, or UDP over TCP.
 - **Watchdog.** Checks each tunnel every minute and restarts it if it hangs (the process is alive but traffic no longer passes).
 - **Stability tuning.** Heartbeat/keepalive settings in tunnel configs, plus TCP keepalive, conntrack and file-limit sysctl tuning.
 - **Offline install.** If the server can't reach GitHub, you can point the script at a release archive you uploaded yourself.
@@ -64,7 +65,7 @@ backhaul-manager
 | # | Option | What it does |
 |---|--------|--------------|
 | 1 | Install Backhaul | Downloads the latest release into `/usr/local/bin/backhaul` |
-| 2 | Create a new tunnel | Guided setup for the server or client side, over IPv4 or IPv6 |
+| 2 | Create a new tunnel | Guided setup for the server or client side, over IPv4 or IPv6, for TCP or UDP |
 | 3 | List tunnels | Shows name, role, IP version, address, state, watchdog and ports |
 | 4 | Tunnel status | `systemctl status` plus the config (token hidden) |
 | 5 | Show logs | Last 50 log lines of a tunnel |
@@ -115,6 +116,23 @@ To test the link before creating a tunnel, run option **6** from the client side
 
 > Both servers need working, routable IPv6. Remember to open the tunnel port in the IPv6 firewall too (`ip6tables`, or `ufw` with `IPV6=yes`).
 
+### UDP tunnels (WireGuard)
+
+Two transport options in the menu carry UDP traffic:
+
+| Option | Transport | Between the servers | Use when |
+|--------|-----------|---------------------|----------|
+| 5 | `udp` | UDP | UDP between the servers works well. Lowest overhead. |
+| 6 | `tcp` + `accept_udp = true` | TCP | UDP between the servers is blocked or throttled. |
+
+In both cases, the **user ports are UDP** (e.g. `51820` for WireGuard). Choose the same option on both sides. For option 6, `accept_udp` is written only on the server, and the client simply uses `tcp`.
+
+Tips:
+
+- Open the user ports as **UDP** in the server firewall. For option 5, open the tunnel port as UDP as well.
+- Set `MTU = 1280` in the users' WireGuard configs. The tunnel adds overhead, and a larger MTU causes fragmentation, slow speeds or stalls.
+- The watchdog can't run a real traffic check on UDP (there's no handshake to test). See [Watchdog](#watchdog).
+
 ### Files
 
 | Path | Purpose |
@@ -152,7 +170,10 @@ The watchdog runs every minute through a systemd timer (`backhaul-watchdog@<name
 | `tls` | A full TLS handshake to `127.0.0.1:<user port>`, which passes **through the tunnel** to the destination | VLESS/Trojan + TLS, Reality |
 | `http` | An HTTP request through the tunnel | WS / HTTP inbounds without TLS |
 | `tcp` | Only checks that the user port accepts connections | Fallback (weak) |
-| `conn` | Checks that an established tunnel connection exists | Client side, or anything else (weak) |
+| `conn` | Checks that an established tunnel connection exists | Client side, UDP over TCP, or anything else (weak) |
+| `alive` | Only checks that the service is running; relies on scheduled restarts | Native `udp` tunnels on the server side |
+
+For UDP tunnels, the check type is chosen automatically (`alive` or `conn`), and a scheduled restart every 6 hours is suggested by default.
 
 For `tls`, enter the inbound's **SNI**: the certificate domain for TLS, or the `serverName` for Reality. If the inbound rejects unknown SNI, a wrong value will make every check fail.
 
@@ -188,7 +209,11 @@ net.ipv4.tcp_keepalive_probes = 6
 net.netfilter.nf_conntrack_max = 262144
 net.core.somaxconn = 4096
 fs.file-max = 1048576
+net.core.rmem_max = 26214400
+net.core.wmem_max = 26214400
 ```
+
+The larger socket buffers help UDP tunnels under load. TCP keepalive and mux settings are skipped for native `udp` tunnels, since they don't apply.
 
 Run this on **both** servers.
 
@@ -215,6 +240,7 @@ Run this on **both** servers.
 - **The client can't connect.** Check that the tunnel port is open on the server (both IPv4 and IPv6 firewalls), and that the token and transport are the same on both sides.
 - **The tunnel is up but users can't connect.** Check that the user ports are open on the server, and from the client that the destination is reachable (`nc -zv DEST_IP 443`).
 - **Frequent watchdog restarts.** Check the watchdog log (option 11 → 3). If restarts are common, try switching the transport from `tcpmux` to `tcp` or `wsmux`.
+- **WireGuard connects but is slow or stalls.** Lower the MTU in the WireGuard config (`1280`). If UDP between the servers is throttled, switch to option 6 (UDP over TCP).
 - **A config change has no effect.** Restart the tunnel (option 7). Configs are only read when the service starts.
 
 ## Credits
