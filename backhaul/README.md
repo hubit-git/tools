@@ -37,13 +37,23 @@ Built for the common Iran ⇄ foreign server setup, but works anywhere Backhaul 
 
 ## Installation
 
+Run as root:
+
 ```bash
-curl -fsSL -o backhaul-manager.sh https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/backhaul-manager.sh
-chmod +x backhaul-manager.sh
-sudo ./backhaul-manager.sh
+bash <(curl -fsSL https://raw.githubusercontent.com/hubit-git/tools/main/backhaul/install.sh)
 ```
 
 Then pick option **1** to install the Backhaul binary.
+
+To keep a local copy and run it later:
+
+```bash
+curl -fsSL -o /usr/local/bin/backhaul-manager https://raw.githubusercontent.com/hubit-git/tools/main/backhaul/install.sh
+chmod +x /usr/local/bin/backhaul-manager
+backhaul-manager
+```
+
+> Use `bash <(curl ...)`, not `curl ... | bash`. The menu is interactive, and piping into bash breaks keyboard input.
 
 > **Server can't reach GitHub?** Download `backhaul_linux_amd64.tar.gz` (or `arm64`) from the [Backhaul releases](https://github.com/Musixal/Backhaul/releases) on another machine, copy it over with `scp`, and enter its path when the installer asks.
 
